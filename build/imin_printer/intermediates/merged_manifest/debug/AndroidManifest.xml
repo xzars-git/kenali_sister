@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.imin.printer.imin_printer" >
+
+    <uses-sdk
+        android:minSdkVersion="16"
+        android:targetSdkVersion="16" />
+
+    <application
+        android:name="com.imin.printer.imin_printer.BaseApplication"
+        tools:replace="android:name" >
+        <provider
+            android:name="com.imin.printer.imin_printer.MyProvider"
+            android:authorities="com.imin.printer.imin_printer"
+            tools:ignore="WrongManifestParent" />
+    </application>
+
+</manifest>

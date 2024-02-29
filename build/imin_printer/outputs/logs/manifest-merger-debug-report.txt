@@ -1,0 +1,41 @@
+-- Merging decision tree log ---
+manifest
+ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:1:1-14:12
+INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:1:1-14:12
+INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:1:1-14:12
+	package
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:3:3-42
+		INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+		INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+	xmlns:tools
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:2:2-48
+	xmlns:android
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:1:11-69
+application
+ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:4:5-13:19
+	tools:replace
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:6:9-37
+	android:name
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:5:9-69
+provider#com.imin.printer.imin_printer.MyProvider
+ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:9:13-12:54
+	android:authorities
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:10:17-68
+	tools:ignore
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:12:17-51
+	android:name
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml:11:17-72
+uses-sdk
+INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+		INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+		ADDED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
+		INJECTED from C:\Users\xzars\AppData\Local\Pub\Cache\hosted\pub.dev\imin_printer-0.5.2\android\src\main\AndroidManifest.xml
