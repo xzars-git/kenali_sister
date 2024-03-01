@@ -1,1177 +1,0 @@
-etPerMessageDeflate {
-  bool serverNoContextTakeover;
-  bool clientNoContextTakeover;
-  int clientMaxWindowBits;
-  int serverMaxWindowBits;
-  bool serverSide;
-
-  RawZLibFilter? decoder;
-  RawZLibFilter? encoder;
-
-  _WebSocketPerMessageDeflate(
-      {this.clientMaxWindowBits = _WebSocketImpl.DEFAULT_WINDOW_BITS,
-      this.serverMaxWindowBits = _WebSocketImpl.DEFAULT_WINDOW_BITS,
-      this.serverNoContextTakeover = false,
-      this.clientNoContextTakeover = false,
-      this.serverSide = false});
-
-  RawZLibFilter _ensureDecoder() => decoder ??= RawZLibFilter.inflateFilter(
-      windowBits: serverSide ? clientMaxWindowBits : serverMaxWindowBits,
-      raw: true);
-
-  RawZLibFilter _ensureEncoder() => encoder ??= RawZLibFilter.deflateFilter(
-      windowBits: serverSide ? serverMaxWindowBits : clientMaxWindowBits,
-      raw: true);
-
-  Uint8List processIncomingMessage(List<int> msg) {
-    var decoder = _ensureDecoder();
-
-    var data = <int>[];
-    data.addAll(msg);
-    data.addAll(const [0x00, 0x00, 0xff, 0xff]);
-
-    decoder.process(data, 0, data.length);
-    final result = BytesBuilder();
-
-    while (true) {
-      final out = decoder.processed();
-      if (out == null) break;
-      result.add(out);
-    }
-
-    if ((serverSide && clientNoContextTakeover) ||
-        (!serverSide && serverNoContextTakeover)) {
-      this.decoder = null;
-    }
-
-    return result.takeBytes();
-  }
-
-  List<int> processOutgoingMessage(List<int> msg) {
-    var encoder = _ensureEncoder();
-    var result = <int>[];
-    Uint8List buffer;
-
-    if (msg is! Uint8List) {
-      for (var i = 0; i < msg.length; i++) {
-        if (msg[i] < 0 || 255 < msg[i]) {
-          throw ArgumentError("List element is not a byte value "
-              "(value ${msg[i]} at index $i)");
-        }
-      }
-      buffer = Uint8List.fromList(msg);
-    } else {
-      buffer = msg;
-    }
-
-    encoder.process(buffer, 0, buffer.length);
-
-    while (true) {
-      final out = encoder.processed();
-      if (out == null) break;
-      result.addAll(out);
-    }
-
-    if ((!serverSide && clientNoContextTakeover) ||
-        (serverSide && serverNoContextTakeover)) {
-      this.encoder = null;
-    }
-
-    if (result.length > 4) {
-      result = result.sublist(0, result.length - 4);
-    }
-
-    // RFC 7692 7.2.3.6. "Generating an Empty Fragment" says that if the
-    // compression library doesn't generate any data when the buffer is empty,
-    // then an empty uncompressed deflate block is used for this purpose. The
-    // 0x00 block has the BFINAL header bit set to 0 and the BTYPE header set to
-    // 00 along with 5 bits of padding. This block decodes to zero bytes.
-    if (result.isEmpty) {
-      return [0x00];
-    }
-
-    return result;
-  }
-}
-
-// TODO(ajohnsen): Make this transformer reusable.
-class _WebSocketOutgoingTransformer
-    extends StreamTransformerBase<dynamic, List<int>> implements EventSink {
-  final _WebSocketImpl webSocket;
-  EventSink<List<int>>? _eventSink;
-
-  final _WebSocketPerMessageDeflate? _deflateHelper;
-
-  _WebSocketOutgoingTransformer(this.webSocket)
-      : _deflateHelper = webSocket._deflate;
-
-  Stream<List<int>> bind(Stream stream) {
-    return Stream<List<int>>.eventTransformed(stream,
-        (EventSink<List<int>> eventSink) {
-      if (_eventSink != null) {
-        throw StateError("WebSocket transformer already used");
-      }
-      _eventSink = eventSink;
-      return this;
-    });
-  }
-
-  void add(message) {
-    if (message is _WebSocketPong) {
-      addFrame(_WebSocketOpcode.PONG, message.payload);
-      return;
-    }
-    if (message is _WebSocketPing) {
-      addFrame(_WebSocketOpcode.PING, message.payload);
-      return;
-    }
-    List<int>? data;
-    int opcode;
-    if (message != null) {
-      List<int> messageData;
-      if (message is String) {
-        opcode = _WebSocketOpcode.TEXT;
-        messageData = utf8.encode(message);
-      } else if (message is List<int>) {
-        opcode = _WebSocketOpcode.BINARY;
-        messageData = message;
-      } else if (message is _EncodedString) {
-        opcode = _WebSocketOpcode.TEXT;
-        messageData = message.bytes;
-      } else {
-        throw ArgumentError(message);
-      }
-      var deflateHelper = _deflateHelper;
-      if (deflateHelper != null) {
-        messageData = deflateHelper.processOutgoingMessage(messageData);
-      }
-      data = messageData;
-    } else {
-      opcode = _WebSocketOpcode.TEXT;
-    }
-    addFrame(opcode, data);
-  }
-
-  void addError(Object error, [StackTrace? stackTrace]) {
-    // TODO(40614): Remove once non-nullability is sound.
-    ArgumentError.checkNotNull(error, "error");
-    _eventSink!.addError(error, stackTrace);
-  }
-
-  void close() {
-    int? code = webSocket._outCloseCode;
-    String? reason = webSocket._outCloseReason;
-    List<int>? data;
-    if (code != null) {
-      data = [
-        (code >> 8) & 0xFF,
-        code & 0xFF,
-        if (reason != null) ...utf8.encode(reason)
-      ];
-    }
-    addFrame(_WebSocketOpcode.CLOSE, data);
-    _eventSink!.close();
-  }
-
-  void addFrame(int opcode, List<int>? data) {
-    createFrame(
-            opcode,
-            data,
-            webSocket._serverSide,
-            _deflateHelper != null &&
-                (opcode == _WebSocketOpcode.TEXT ||
-                    opcode == _WebSocketOpcode.BINARY))
-        .forEach((e) {
-      _eventSink!.add(e);
-    });
-  }
-
-  static Iterable<List<int>> createFrame(
-      int opcode, List<int>? data, bool serverSide, bool compressed) {
-    bool mask = !serverSide; // Masking not implemented for server.
-    int dataLength = data == null ? 0 : data.length;
-    // Determine the header size.
-    int headerSize = (mask) ? 6 : 2;
-    if (dataLength > 65535) {
-      headerSize += 8;
-    } else if (dataLength > 125) {
-      headerSize += 2;
-    }
-    Uint8List header = Uint8List(headerSize);
-    int index = 0;
-
-    // Set FIN and opcode.
-    var hoc = _WebSocketProtocolTransformer.FIN |
-        (compressed ? _WebSocketProtocolTransformer.RSV1 : 0) |
-        (opcode & _WebSocketProtocolTransformer.OPCODE);
-
-    header[index++] = hoc;
-    // Determine size and position of length field.
-    int lengthBytes = 1;
-    if (dataLength > 65535) {
-      header[index++] = 127;
-      lengthBytes = 8;
-    } else if (dataLength > 125) {
-      header[index++] = 126;
-      lengthBytes = 2;
-    }
-    // Write the length in network byte order into the header.
-    for (int i = 0; i < lengthBytes; i++) {
-      header[index++] = dataLength >> (((lengthBytes - 1) - i) * 8) & 0xFF;
-    }
-    if (mask) {
-      header[1] |= 1 << 7;
-      var maskBytes = _CryptoUtils.getRandomBytes(4);
-      header.setRange(index, index + 4, maskBytes);
-      index += 4;
-      if (data != null) {
-        Uint8List list;
-        // If this is a text message just do the masking inside the
-        // encoded data.
-        if (opcode == _WebSocketOpcode.TEXT && data is Uint8List) {
-          list = data;
-        } else {
-          if (data is Uint8List) {
-            list = Uint8List.fromList(data);
-          } else {
-            list = Uint8List(data.length);
-            for (int i = 0; i < data.length; i++) {
-              if (data[i] < 0 || 255 < data[i]) {
-                throw ArgumentError("List element is not a byte value "
-                    "(value ${data[i]} at index $i)");
-              }
-              list[i] = data[i];
-            }
-          }
-        }
-        const int BLOCK_SIZE = 16;
-        int blockCount = list.length ~/ BLOCK_SIZE;
-        if (blockCount > 0) {
-          // Create mask block.
-          int mask = 0;
-          for (int i = 3; i >= 0; i--) {
-            mask = (mask << 8) | maskBytes[i];
-          }
-          Int32x4 blockMask = Int32x4(mask, mask, mask, mask);
-          Int32x4List blockBuffer =
-              Int32x4List.view(list.buffer, list.offsetInBytes, blockCount);
-          for (int i = 0; i < blockBuffer.length; i++) {
-            blockBuffer[i] ^= blockMask;
-          }
-        }
-        // Handle end.
-        for (int i = blockCount * BLOCK_SIZE; i < list.length; i++) {
-          list[i] ^= maskBytes[i & 3];
-        }
-        data = list;
-      }
-    }
-    assert(index == headerSize);
-    if (data == null) {
-      return [header];
-    } else {
-      return [header, data];
-    }
-  }
-}
-
-class _WebSocketConsumer implements StreamConsumer {
-  final _WebSocketImpl webSocket;
-  final Socket socket;
-  StreamController? _controller;
-  StreamSubscription? _subscription;
-  bool _issuedPause = false;
-  bool _closed = false;
-  final Completer _closeCompleter = Completer<WebSocket>();
-  Completer? _completer;
-
-  _WebSocketConsumer(this.webSocket, this.socket);
-
-  void _onListen() {
-    _subscription?.cancel();
-  }
-
-  void _onPause() {
-    var subscription = _subscription;
-    if (subscription != null) {
-      subscription.pause();
-    } else {
-      _issuedPause = true;
-    }
-  }
-
-  void _onResume() {
-    var subscription = _subscription;
-    if (subscription != null) {
-      subscription.resume();
-    } else {
-      _issuedPause = false;
-    }
-  }
-
-  void _cancel() {
-    var subscription = _subscription;
-    if (subscription != null) {
-      _subscription = null;
-      subscription.cancel();
-    }
-  }
-
-  StreamController _ensureController() {
-    var controller = _controller;
-    if (controller != null) return controller;
-    controller = _controller = StreamController(
-        sync: true,
-        onPause: _onPause,
-        onResume: _onResume,
-        onCancel: _onListen);
-    var stream =
-        controller.stream.transform(_WebSocketOutgoingTransformer(webSocket));
-    socket.addStream(stream).then((_) {
-      _done();
-      _closeCompleter.complete(webSocket);
-    }, onError: (Object error, StackTrace stackTrace) {
-      _closed = true;
-      _cancel();
-      if (error is ArgumentError) {
-        if (!_done(error, stackTrace)) {
-          _closeCompleter.completeError(error, stackTrace);
-        }
-      } else {
-        _done();
-        _closeCompleter.complete(webSocket);
-      }
-    });
-    return controller;
-  }
-
-  bool _done([Object? error, StackTrace? stackTrace]) {
-    var completer = _completer;
-    if (completer == null) return false;
-    if (error != null) {
-      completer.completeError(error, stackTrace);
-    } else {
-      completer.complete(webSocket);
-    }
-    _completer = null;
-    return true;
-  }
-
-  Future addStream(Stream stream) {
-    if (_closed) {
-      stream.listen(null).cancel();
-      return Future.value(webSocket);
-    }
-    _ensureController();
-    var completer = _completer = Completer();
-    var subscription = _subscription = stream.listen((data) {
-      _controller!.add(data);
-    }, onDone: _done, onError: _done, cancelOnError: true);
-    if (_issuedPause) {
-      subscription.pause();
-      _issuedPause = false;
-    }
-    return completer.future;
-  }
-
-  Future close() {
-    _ensureController().close();
-
-    return _closeCompleter.future
-        .then((_) => socket.close().catchError((_) {}).then((_) => webSocket));
-  }
-
-  void add(data) {
-    if (_closed) return;
-    var controller = _ensureController();
-    // Stop sending message if _controller has been closed.
-    // https://github.com/dart-lang/sdk/issues/37441
-    if (controller.isClosed) return;
-    controller.add(data);
-  }
-
-  void closeSocket() {
-    _closed = true;
-    _cancel();
-    close();
-  }
-}
-
-class _WebSocketImpl extends Stream with _ServiceObject implements WebSocket {
-  // Use default Map so we keep order.
-  static final Map<int, _WebSocketImpl> _webSockets = <int, _WebSocketImpl>{};
-  static const int DEFAULT_WINDOW_BITS = 15;
-  static const String PER_MESSAGE_DEFLATE = "permessage-deflate";
-
-  final String? protocol;
-
-  final StreamController _controller;
-  StreamSubscription? _subscription;
-  late StreamSink _sink;
-
-  final Socket _socket;
-  final bool _serverSide;
-  int _readyState = WebSocket.connecting;
-  bool _writeClosed = false;
-  int? _closeCode;
-  String? _closeReason;
-  Duration? _pingInterval;
-  Timer? _pingTimer;
-  late _WebSocketConsumer _consumer;
-
-  int? _outCloseCode;
-  String? _outCloseReason;
-  Timer? _closeTimer;
-  _WebSocketPerMessageDeflate? _deflate;
-
-  static final HttpClient _httpClient = HttpClient();
-
-  static Future<WebSocket> connect(
-      String url, Iterable<String>? protocols, Map<String, dynamic>? headers,
-      {CompressionOptions compression = CompressionOptions.compressionDefault,
-      HttpClient? customClient}) {
-    Uri uri = Uri.parse(url);
-    if (!uri.isScheme("ws") && !uri.isScheme("wss")) {
-      throw WebSocketException("Unsupported URL scheme '${uri.scheme}'");
-    }
-
-    Random random = Random();
-    // Generate 16 random bytes.
-    Uint8List nonceData = Uint8List(16);
-    for (int i = 0; i < 16; i++) {
-      nonceData[i] = random.nextInt(256);
-    }
-    String nonce = base64Encode(nonceData);
-
-    final callerStackTrace = StackTrace.current;
-
-    uri = Uri(
-        scheme: uri.isScheme("wss") ? "https" : "http",
-        userInfo: uri.userInfo,
-        host: uri.host,
-        port: uri.port,
-        path: uri.path,
-        query: uri.query,
-        fragment: uri.fragment);
-    return (customClient ?? _httpClient).openUrl("GET", uri).then((request) {
-      if (uri.userInfo != null && uri.userInfo.isNotEmpty) {
-        // If the URL contains user information use that for basic
-        // authorization.
-        String auth = base64Encode(utf8.encode(uri.userInfo));
-        request.headers.set(HttpHeaders.authorizationHeader, "Basic $auth");
-      }
-      if (headers != null) {
-        headers.forEach((field, value) => request.headers.add(field, value));
-      }
-      // Setup the initial handshake.
-      request.headers
-        ..set(HttpHeaders.connectionHeader, "Upgrade")
-        ..set(HttpHeaders.upgradeHeader, "websocket")
-        ..set("Sec-WebSocket-Key", nonce)
-        ..set("Cache-Control", "no-cache")
-        ..set("Sec-WebSocket-Version", "13");
-      if (protocols != null) {
-        request.headers.add("Sec-WebSocket-Protocol", protocols.toList());
-      }
-
-      if (compression.enabled) {
-        request.headers
-            .add("Sec-WebSocket-Extensions", compression._createHeader());
-      }
-
-      return request.close();
-    }).then((response) {
-      Future<WebSocket> error(String message) {
-        // Flush data.
-        response.detachSocket().then((socket) {
-          socket.destroy();
-        });
-        return Future<WebSocket>.error(
-            WebSocketException(message), callerStackTrace);
-      }
-
-      var connectionHeader = response.headers[HttpHeaders.connectionHeader];
-      if (response.statusCode != HttpStatus.switchingProtocols ||
-          connectionHeader == null ||
-          !connectionHeader.any((value) => value.toLowerCase() == "upgrade") ||
-          response.headers.value(HttpHeaders.upgradeHeader)!.toLowerCase() !=
-              "websocket") {
-        return error("Connection to '$uri' was not upgraded to websocket");
-      }
-      String? accept = response.headers.value("Sec-WebSocket-Accept");
-      if (accept == null) {
-        return error(
-            "Response did not contain a 'Sec-WebSocket-Accept' header");
-      }
-      _SHA1 sha1 = _SHA1();
-      sha1.add("$nonce$_webSocketGUID".codeUnits);
-      List<int> expectedAccept = sha1.close();
-      List<int> receivedAccept = base64Decode(accept);
-      if (expectedAccept.length != receivedAccept.length) {
-        return error(
-            "Response header 'Sec-WebSocket-Accept' is the wrong length");
-      }
-      for (int i = 0; i < expectedAccept.length; i++) {
-        if (expectedAccept[i] != receivedAccept[i]) {
-          return error("Bad response 'Sec-WebSocket-Accept' header");
-        }
-      }
-      var protocol = response.headers.value('Sec-WebSocket-Protocol');
-
-      _WebSocketPerMessageDeflate? deflate =
-          negotiateClientCompression(response, compression);
-
-      return response.detachSocket().then<WebSocket>((socket) =>
-          _WebSocketImpl._fromSocket(
-              socket, protocol, compression, false, deflate));
-    });
-  }
-
-  static _WebSocketPerMessageDeflate? negotiateClientCompression(
-      HttpClientResponse response, CompressionOptions compression) {
-    String extensionHeader =
-        response.headers.value('Sec-WebSocket-Extensions') ?? "";
-
-    var hv = HeaderValue.parse(extensionHeader, valueSeparator: ',');
-
-    if (compression.enabled && hv.value == PER_MESSAGE_DEFLATE) {
-      var serverNoContextTakeover =
-          hv.parameters.containsKey(_serverNoContextTakeover);
-      var clientNoContextTakeover =
-          hv.parameters.containsKey(_clientNoContextTakeover);
-
-      int getWindowBits(String type) {
-        var o = hv.parameters[type];
-        if (o == null) {
-          return DEFAULT_WINDOW_BITS;
-        }
-
-        return int.tryParse(o) ?? DEFAULT_WINDOW_BITS;
-      }
-
-      return _WebSocketPerMessageDeflate(
-          clientMaxWindowBits: getWindowBits(_clientMaxWindowBits),
-          serverMaxWindowBits: getWindowBits(_serverMaxWindowBits),
-          clientNoContextTakeover: clientNoContextTakeover,
-          serverNoContextTakeover: serverNoContextTakeover);
-    }
-
-    return null;
-  }
-
-  _WebSocketImpl._fromSocket(
-      this._socket, this.protocol, CompressionOptions compression,
-      [this._serverSide = false, _WebSocketPerMessageDeflate? deflate])
-      : _controller = StreamController(sync: true) {
-    _consumer = _WebSocketConsumer(this, _socket);
-    _sink = _StreamSinkImpl(_consumer);
-    _readyState = WebSocket.open;
-    _deflate = deflate;
-
-    var transformer = _WebSocketProtocolTransformer(_serverSide, deflate);
-    var subscription = _subscription = transformer.bind(_socket).listen((data) {
-      if (data is _WebSocketPing) {
-        if (!_writeClosed) _consumer.add(_WebSocketPong(data.payload));
-      } else if (data is _WebSocketPong) {
-        // Simply set pingInterval, as it'll cancel any timers.
-        pingInterval = _pingInterval;
-      } else {
-        _controller.add(data);
-      }
-    }, onError: (Object error, StackTrace stackTrace) {
-      _closeTimer?.cancel();
-      if (error is FormatException) {
-        _close(WebSocketStatus.invalidFramePayloadData);
-      } else {
-        _close(WebSocketStatus.protocolError);
-      }
-      // An error happened, set the close code set above.
-      _closeCode = _outCloseCode;
-      _closeReason = _outCloseReason;
-      _controller.close();
-    }, onDone: () {
-      _closeTimer?.cancel();
-      if (_readyState == WebSocket.open) {
-        _readyState = WebSocket.closing;
-        if (!_isReservedStatusCode(transformer.closeCode)) {
-          _close(transformer.closeCode, transformer.closeReason);
-        } else {
-          _close();
-        }
-        _readyState = WebSocket.closed;
-      }
-      // Protocol close, use close code from transformer.
-      _closeCode = transformer.closeCode;
-      _closeReason = transformer.closeReason;
-      _controller.close();
-    }, cancelOnError: true);
-    subscription.pause();
-    _controller
-      ..onListen = subscription.resume
-      ..onCancel = () {
-        _subscription!.cancel();
-        _subscription = null;
-      }
-      ..onPause = subscription.pause
-      ..onResume = subscription.resume;
-
-    _webSockets[_serviceId] = this;
-  }
-
-  StreamSubscription listen(void onData(message)?,
-      {Function? onError, void Function()? onDone, bool? cancelOnError}) {
-    return _controller.stream.listen(onData,
-        onError: onError, onDone: onDone, cancelOnError: cancelOnError);
-  }
-
-  Duration? get pingInterval => _pingInterval;
-
-  void set pingInterval(Duration? interval) {
-    if (_writeClosed) return;
-    _pingTimer?.cancel();
-    _pingInterval = interval;
-
-    if (interval == null) return;
-
-    _pingTimer = Timer(interval, () {
-      if (_writeClosed) return;
-      _consumer.add(_WebSocketPing());
-      _pingTimer = Timer(interval, () {
-        _closeTimer?.cancel();
-        // No pong received.
-        _close(WebSocketStatus.goingAway);
-        _closeCode = _outCloseCode;
-        _closeReason = _outCloseReason;
-        _controller.close();
-      });
-    });
-  }
-
-  int get readyState => _readyState;
-
-  String get extensions => "";
-  int? get closeCode => _closeCode;
-  String? get closeReason => _closeReason;
-
-  void add(data) {
-    _sink.add(data);
-  }
-
-  void addUtf8Text(List<int> bytes) {
-    // TODO(40614): Remove once non-nullability is sound.
-    ArgumentError.checkNotNull(bytes, "bytes");
-    _sink.add(_EncodedString(bytes));
-  }
-
-  void addError(Object error, [StackTrace? stackTrace]) {
-    _sink.addError(error, stackTrace);
-  }
-
-  Future addStream(Stream stream) => _sink.addStream(stream);
-  Future get done => _sink.done;
-
-  Future close([int? code, String? reason]) {
-    if (_isReservedStatusCode(code)) {
-      throw WebSocketException("Reserved status code $code");
-    }
-    if (_outCloseCode == null) {
-      _outCloseCode = code;
-      _outCloseReason = reason;
-    }
-    if (!_controller.isClosed) {
-      // If a close has not yet been received from the other end then
-      //   1) make sure to listen on the stream so the close frame will be
-      //      processed if received.
-      //   2) set a timer terminate the connection if a close frame is
-      //      not received.
-      if (!_controller.hasListener && _subscription != null) {
-        _controller.stream.drain().catchError((_) {});
-      }
-      _closeTimer ??= Timer(const Duration(seconds: 5), () {
-        // Reuse code and reason from the local close.
-        _closeCode = _outCloseCode;
-        _closeReason = _outCloseReason;
-        _subscription?.cancel();
-        _controller.close();
-        _webSockets.remove(_serviceId);
-      });
-    }
-    return _sink.close();
-  }
-
-  static String? get userAgent => _httpClient.userAgent;
-
-  static set userAgent(String? userAgent) {
-    _httpClient.userAgent = userAgent;
-  }
-
-  void _close([int? code, String? reason]) {
-    if (_writeClosed) return;
-    if (_outCloseCode == null) {
-      _outCloseCode = code;
-      _outCloseReason = reason;
-    }
-    _pingTimer?.cancel();
-    _writeClosed = true;
-    _consumer.closeSocket();
-    _webSockets.remove(_serviceId);
-  }
-
-  String get _serviceTypePath => 'io/websockets';
-  String get _serviceTypeName => 'WebSocket';
-
-  static bool _isReservedStatusCode(int? code) {
-    return code != null &&
-        (code < WebSocketStatus.normalClosure ||
-            code == WebSocketStatus.reserved1004 ||
-            code == WebSocketStatus.noStatusReceived ||
-            code == WebSocketStatus.abnormalClosure ||
-            (code > WebSocketStatus.internalServerError &&
-                code < WebSocketStatus.reserved1015) ||
-            (code >= WebSocketStatus.reserved1015 && code < 3000));
-  }
-}
-… NN<FFF>>%#####$$$$$DK+"C$IN=MN&M>&"!     !%#84O0;/LE"C A::0-GI#==K  $-68%:&"#4<G<97G<-:24C8*(18$$$ &# )
-A0%JN3'3;'L"#AEG:A3
- :1 (9+*;3'I
-=4F7'
-3$(9GI%#?(''!&/&/
- (,7%)/+"8#6,"%84?8$;
-"?"?0,* ?#!""@ :&2/.)H79E-@&)'9L59M%'-D2$5??@12<BK*A&>?9IL0JH%6$N
-8#Q?MFQ0J$B4$B41<<337#J$*."HCF.>$  FE,,!MJMJ4$1+#'344$-*B0
-(/'435IONQJ3$M"$50-*6+ @%8%8(,)*.(%&*#I&::0-)03	,/#&48*GD5"%#.2@94#?,L64DD#-+42H7!
-#4 )/?$M9)
-F'
-!5"!%<3& & & )"/1O(+8$)<
--8 )2%$$&.><!"P*<5%O'O-B&%*%)6$NO#7J!)#*,18 !N=C?MN&76*+.K!K00(<MB&PNLGI3/7<K86F
-G-=A&?BEBFB$?$?'%&
-7*DD<=CH53("KQ$H+@&8&9/:"&+)=B
-(:*.'!%($3K-I/."& '(+$(
-%$+&:0&:'>!.'>! !FK%G?7=7$(!(
-9,'-! $2.11487;8Ddart:_http/websocket_impl.dartÀ hÕÀ h×À k8>org-dartlang-sdk:///third_party/dart/sdk/lib/_http/crypto.dart£// Copyright (c) 2012, the Dart project authors.  Please see the AUTHORS file
-// for details. All rights reserved. Use of this source code is governed by a
-// BSD-style license that can be found in the LICENSE file.
-
-part of dart._http;
-
-class _CryptoUtils {
-  static Uint8List getRandomBytes(int count) {
-    final Uint8List result = Uint8List(count);
-    for (int i = 0; i < count; i++) {
-      result[i] = Random.secure().nextInt(0xff);
-    }
-    return result;
-  }
-
-  static String bytesToHex(List<int> bytes) {
-    var result = StringBuffer();
-    for (var part in bytes) {
-      result.write('${part < 16 ? '0' : ''}${part.toRadixString(16)}');
-    }
-    return result.toString();
-  }
-}
-
-// Constants.
-const _MASK_8 = 0xff;
-const _MASK_32 = 0xffffffff;
-const _BITS_PER_BYTE = 8;
-const _BYTES_PER_WORD = 4;
-
-// Base class encapsulating common behavior for cryptographic hash
-// functions.
-abstract class _HashBase {
-  // Hasher state.
-  final int _chunkSizeInWords;
-  final bool _bigEndianWords;
-  int _lengthInBytes = 0;
-  List<int> _pendingData;
-  final Uint32List _currentChunk;
-  final Uint32List _h;
-  bool _digestCalled = false;
-
-  _HashBase(this._chunkSizeInWords, int digestSizeInWords, this._bigEndianWords)
-      : _pendingData = [],
-        _currentChunk = Uint32List(_chunkSizeInWords),
-        _h = Uint32List(digestSizeInWords);
-
-  // Update the hasher with more data.
-  void add(List<int> data) {
-    if (_digestCalled) {
-      throw StateError('Hash update method called after digest was retrieved');
-    }
-    _lengthInBytes += data.length;
-    _pendingData.addAll(data);
-    _iterate();
-  }
-
-  // Finish the hash computation and return the digest string.
-  List<int> close() {
-    if (_digestCalled) {
-      return _resultAsBytes();
-    }
-    _digestCalled = true;
-    _finalizeData();
-    _iterate();
-    assert(_pendingData.isEmpty);
-    return _resultAsBytes();
-  }
-
-  // Returns the block size of the hash in bytes.
-  int get blockSize {
-    return _chunkSizeInWords * _BYTES_PER_WORD;
-  }
-
-  // One round of the hash computation.
-  _updateHash(Uint32List m);
-
-  // Helper methods.
-  int _add32(int x, int y) => (x + y) & _MASK_32;
-  int _roundUp(int val, int n) => (val + n - 1) & -n;
-
-  // Rotate left limiting to unsigned 32-bit values.
-  int _rotl32(int val, int shift) {
-    var mod_shift = shift & 31;
-    return ((val << mod_shift) & _MASK_32) |
-        ((val & _MASK_32) >> (32 - mod_shift));
-  }
-
-  // Compute the final result as a list of bytes from the hash words.
-  List<int> _resultAsBytes() {
-    var result = <int>[];
-    for (var i = 0; i < _h.length; i++) {
-      result.addAll(_wordToBytes(_h[i]));
-    }
-    return result;
-  }
-
-  // Converts a list of bytes to a chunk of 32-bit words.
-  void _bytesToChunk(List<int> data, int dataIndex) {
-    assert((data.length - dataIndex) >= (_chunkSizeInWords * _BYTES_PER_WORD));
-
-    for (var wordIndex = 0; wordIndex < _chunkSizeInWords; wordIndex++) {
-      var w3 = _bigEndianWords ? data[dataIndex] : data[dataIndex + 3];
-      var w2 = _bigEndianWords ? data[dataIndex + 1] : data[dataIndex + 2];
-      var w1 = _bigEndianWords ? data[dataIndex + 2] : data[dataIndex + 1];
-      var w0 = _bigEndianWords ? data[dataIndex + 3] : data[dataIndex];
-      dataIndex += 4;
-      var word = (w3 & 0xff) << 24;
-      word |= (w2 & _MASK_8) << 16;
-      word |= (w1 & _MASK_8) << 8;
-      word |= (w0 & _MASK_8);
-      _currentChunk[wordIndex] = word;
-    }
-  }
-
-  // Convert a 32-bit word to four bytes.
-  List<int> _wordToBytes(int word) {
-    List<int> bytes = List.filled(_BYTES_PER_WORD, 0);
-    bytes[0] = (word >> (_bigEndianWords ? 24 : 0)) & _MASK_8;
-    bytes[1] = (word >> (_bigEndianWords ? 16 : 8)) & _MASK_8;
-    bytes[2] = (word >> (_bigEndianWords ? 8 : 16)) & _MASK_8;
-    bytes[3] = (word >> (_bigEndianWords ? 0 : 24)) & _MASK_8;
-    return bytes;
-  }
-
-  // Iterate through data updating the hash computation for each
-  // chunk.
-  void _iterate() {
-    var len = _pendingData.length;
-    var chunkSizeInBytes = _chunkSizeInWords * _BYTES_PER_WORD;
-    if (len >= chunkSizeInBytes) {
-      var index = 0;
-      for (; (len - index) >= chunkSizeInBytes; index += chunkSizeInBytes) {
-        _bytesToChunk(_pendingData, index);
-        _updateHash(_currentChunk);
-      }
-      _pendingData = _pendingData.sublist(index, len);
-    }
-  }
-
-  // Finalize the data. Add a 1 bit to the end of the message. Expand with
-  // 0 bits and add the length of the message.
-  void _finalizeData() {
-    _pendingData.add(0x80);
-    var contentsLength = _lengthInBytes + 9;
-    var chunkSizeInBytes = _chunkSizeInWords * _BYTES_PER_WORD;
-    var finalizedLength = _roundUp(contentsLength, chunkSizeInBytes);
-    var zeroPadding = finalizedLength - contentsLength;
-    for (var i = 0; i < zeroPadding; i++) {
-      _pendingData.add(0);
-    }
-    var lengthInBits = _lengthInBytes * _BITS_PER_BYTE;
-    assert(lengthInBits < pow(2, 32));
-    if (_bigEndianWords) {
-      _pendingData.addAll(_wordToBytes(0));
-      _pendingData.addAll(_wordToBytes(lengthInBits & _MASK_32));
-    } else {
-      _pendingData.addAll(_wordToBytes(lengthInBits & _MASK_32));
-      _pendingData.addAll(_wordToBytes(0));
-    }
-  }
-}
-
-// The MD5 hasher is used to compute an MD5 message digest.
-class _MD5 extends _HashBase {
-  _MD5() : super(16, 4, false) {
-    _h[0] = 0x67452301;
-    _h[1] = 0xefcdab89;
-    _h[2] = 0x98badcfe;
-    _h[3] = 0x10325476;
-  }
-
-  static const _k = [
-    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, //
-    0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, //
-    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, //
-    0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, //
-    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, //
-    0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, //
-    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa, //
-    0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, //
-    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, //
-    0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, //
-    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
-  ];
-
-  static const _r = [
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, //
-    20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, //
-    16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, //
-    10, 15, 21, 6, 10, 15, 21
-  ];
-
-  // Compute one iteration of the MD5 algorithm with a chunk of
-  // 16 32-bit pieces.
-  void _updateHash(Uint32List m) {
-    assert(m.length == 16);
-
-    var a = _h[0];
-    var b = _h[1];
-    var c = _h[2];
-    var d = _h[3];
-
-    int t0;
-    int t1;
-
-    for (var i = 0; i < 64; i++) {
-      if (i < 16) {
-        t0 = (b & c) | ((~b & _MASK_32) & d);
-        t1 = i;
-      } else if (i < 32) {
-        t0 = (d & b) | ((~d & _MASK_32) & c);
-        t1 = ((5 * i) + 1) % 16;
-      } else if (i < 48) {
-        t0 = b ^ c ^ d;
-        t1 = ((3 * i) + 5) % 16;
-      } else {
-        t0 = c ^ (b | (~d & _MASK_32));
-        t1 = (7 * i) % 16;
-      }
-
-      var temp = d;
-      d = c;
-      c = b;
-      b = _add32(
-          b, _rotl32(_add32(_add32(a, t0), _add32(_k[i], m[t1])), _r[i]));
-      a = temp;
-    }
-
-    _h[0] = _add32(a, _h[0]);
-    _h[1] = _add32(b, _h[1]);
-    _h[2] = _add32(c, _h[2]);
-    _h[3] = _add32(d, _h[3]);
-  }
-}
-
-// The SHA1 hasher is used to compute an SHA1 message digest.
-class _SHA1 extends _HashBase {
-  final List<int> _w;
-
-  // Construct a SHA1 hasher object.
-  _SHA1()
-      : _w = List<int>.filled(80, 0),
-        super(16, 5, true) {
-    _h[0] = 0x67452301;
-    _h[1] = 0xEFCDAB89;
-    _h[2] = 0x98BADCFE;
-    _h[3] = 0x10325476;
-    _h[4] = 0xC3D2E1F0;
-  }
-
-  // Compute one iteration of the SHA1 algorithm with a chunk of
-  // 16 32-bit pieces.
-  void _updateHash(Uint32List m) {
-    assert(m.length == 16);
-
-    var a = _h[0];
-    var b = _h[1];
-    var c = _h[2];
-    var d = _h[3];
-    var e = _h[4];
-
-    for (var i = 0; i < 80; i++) {
-      if (i < 16) {
-        _w[i] = m[i];
-      } else {
-        var n = _w[i - 3] ^ _w[i - 8] ^ _w[i - 14] ^ _w[i - 16];
-        _w[i] = _rotl32(n, 1);
-      }
-      var t = _add32(_add32(_rotl32(a, 5), e), _w[i]);
-      if (i < 20) {
-        t = _add32(_add32(t, (b & c) | (~b & d)), 0x5A827999);
-      } else if (i < 40) {
-        t = _add32(_add32(t, (b ^ c ^ d)), 0x6ED9EBA1);
-      } else if (i < 60) {
-        t = _add32(_add32(t, (b & c) | (b & d) | (c & d)), 0x8F1BBCDC);
-      } else {
-        t = _add32(_add32(t, b ^ c ^ d), 0xCA62C1D6);
-      }
-
-      e = d;
-      d = c;
-      c = _rotl32(b, 30);
-      b = a;
-      a = t & _MASK_32;
-    }
-
-    _h[0] = _add32(a, _h[0]);
-    _h[1] = _add32(b, _h[1]);
-    _h[2] = _add32(c, _h[2]);
-    _h[3] = _add32(d, _h[3]);
-    _h[4] = _add32(e, _h[4]);
-  }
-}
-( NN<//&1.!HC"Q7,'P#?"20(265$ -0F**:6PJHLLH$$#'*%7????A#@#M,$7K/-@F8,8',BB,<!OOOOOOOOOO3MKN@##..!!(K> %
-&A##A7?8H6dart:_http/crypto.dart Aorg-dartlang-sdk:///third_party/dart/sdk/lib/_http/http_date.dart§<// Copyright (c) 2012, the Dart project authors.  Please see the AUTHORS file
-// for details. All rights reserved. Use of this source code is governed by a
-// BSD-style license that can be found in the LICENSE file.
-
-part of dart._http;
-
-/// Utility functions for working with dates with HTTP specific date
-/// formats.
-class HttpDate {
-  // From RFC-2616 section "3.3.1 Full Date",
-  // http://tools.ietf.org/html/rfc2616#section-3.3.1
-  //
-  // HTTP-date    = rfc1123-date | rfc850-date | asctime-date
-  // rfc1123-date = wkday "," SP date1 SP time SP "GMT"
-  // rfc850-date  = weekday "," SP date2 SP time SP "GMT"
-  // asctime-date = wkday SP date3 SP time SP 4DIGIT
-  // date1        = 2DIGIT SP month SP 4DIGIT
-  //                ; day month year (e.g., 02 Jun 1982)
-  // date2        = 2DIGIT "-" month "-" 2DIGIT
-  //                ; day-month-year (e.g., 02-Jun-82)
-  // date3        = month SP ( 2DIGIT | ( SP 1DIGIT ))
-  //                ; month day (e.g., Jun  2)
-  // time         = 2DIGIT ":" 2DIGIT ":" 2DIGIT
-  //                ; 00:00:00 - 23:59:59
-  // wkday        = "Mon" | "Tue" | "Wed"
-  //              | "Thu" | "Fri" | "Sat" | "Sun"
-  // weekday      = "Monday" | "Tuesday" | "Wednesday"
-  //              | "Thursday" | "Friday" | "Saturday" | "Sunday"
-  // month        = "Jan" | "Feb" | "Mar" | "Apr"
-  //              | "May" | "Jun" | "Jul" | "Aug"
-  //              | "Sep" | "Oct" | "Nov" | "Dec"
-
-  /// Format a date according to
-  /// [RFC-1123](http://tools.ietf.org/html/rfc1123 "RFC-1123"),
-  /// e.g. `Thu, 1 Jan 1970 00:00:00 GMT`.
-  static String format(DateTime date) {
-    const List wkday = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const List month = [
-      "Jan",
-      "Feb",
-      "Mar",
-      "Apr",
-      "May",
-      "Jun",
-      "Jul",
-      "Aug",
-      "Sep",
-      "Oct",
-      "Nov",
-      "Dec"
-    ];
-
-    DateTime d = date.toUtc();
-    StringBuffer sb = StringBuffer()
-      ..write(wkday[d.weekday - 1])
-      ..write(", ")
-      ..write(d.day <= 9 ? "0" : "")
-      ..write(d.day.toString())
-      ..write(" ")
-      ..write(month[d.month - 1])
-      ..write(" ")
-      ..write(d.year.toString())
-      ..write(d.hour <= 9 ? " 0" : " ")
-      ..write(d.hour.toString())
-      ..write(d.minute <= 9 ? ":0" : ":")
-      ..write(d.minute.toString())
-      ..write(d.second <= 9 ? ":0" : ":")
-      ..write(d.second.toString())
-      ..write(" GMT");
-    return sb.toString();
-  }
-
-  /// Parse a date string in either of the formats
-  /// [RFC-1123](http://tools.ietf.org/html/rfc1123 "RFC-1123"),
-  /// [RFC-850](http://tools.ietf.org/html/rfc850 "RFC-850") or
-  /// ANSI C's asctime() format. These formats are listed here.
-  ///
-  ///     Thu, 1 Jan 1970 00:00:00 GMT
-  ///     Thursday, 1-Jan-1970 00:00:00 GMT
-  ///     Thu Jan  1 00:00:00 1970
-  ///
-  /// For more information see [RFC-2616 section
-  /// 3.1.1](http://tools.ietf.org/html/rfc2616#section-3.3.1
-  /// "RFC-2616 section 3.1.1").
-  static DateTime parse(String date) {
-    final int SP = 32;
-    const List wkdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const List weekdays = [
-      "Monday",
-      "Tuesday",
-      "Wednesday",
-      "Thursday",
-      "Friday",
-      "Saturday",
-      "Sunday"
-    ];
-    const List months = [
-      "Jan",
-      "Feb",
-      "Mar",
-      "Apr",
-      "May",
-      "Jun",
-      "Jul",
-      "Aug",
-      "Sep",
-      "Oct",
-      "Nov",
-      "Dec"
-    ];
-
-    final int formatRfc1123 = 0;
-    final int formatRfc850 = 1;
-    final int formatAsctime = 2;
-
-    int index = 0;
-    String tmp;
-
-    void expect(String s) {
-      if (date.length - index < s.length) {
-        throw HttpException("Invalid HTTP date $date");
-      }
-      String tmp = date.substring(index, index + s.length);
-      if (tmp != s) {
-        throw HttpException("Invalid HTTP date $date");
-      }
-      index += s.length;
-    }
-
-    int expectWeekday() {
-      int weekday;
-      // The formatting of the weekday signals the format

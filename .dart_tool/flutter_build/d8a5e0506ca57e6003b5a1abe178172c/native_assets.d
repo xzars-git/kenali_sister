@@ -1,1 +1,0 @@
- D:\\Free\ Lance\\Aplikasi\ Matematika\ UNY\\kenali_sister\\.dart_tool\\flutter_build\\d8a5e0506ca57e6003b5a1abe178172c\\native_assets.yaml: 
